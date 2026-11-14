@@ -15,13 +15,13 @@ from selenium.common.exceptions import (
 )
 
 # ===================== CONFIGURATION =====================
-INPUT_EXCEL = r"C:\path\to\your_input.xlsx"       # <-- your Excel file (Udyam in E2.., vendor in C2..)
-OUTPUT_EXCEL = r"C:\path\to\output.xlsx"          # <-- results file (A:Name, B:Udyam No, C:Activity, D:Year, E:Type)
-PDF_FOLDER = r"C:\path\to\pdfs"                   # <-- where PDFs will be saved
+INPUT_EXCEL = r"C:\path\to\your_input.xlsx"       # <- your Excel file
+OUTPUT_EXCEL = r"C:\path\to\output.xlsx"          # <- where results file will be saved
+PDF_FOLDER = r"C:\path\to\pdfs"                   # <- where PDFs will be saved
 INVALID_TXT = os.path.join(PDF_FOLDER, "invalidnumber.txt")
 START_ROW = 2
-VENDOR_COL = 3  # C
-UDYAM_COL = 5   # E
+VENDOR_COL = 3
+UDYAM_COL = 5
 URL = "https://www.udyamregistration.gov.in/default.aspx"
 OUTPUT_HEADERS = ["Enterprise Name", "Udyam Number", "Activity", "Year", "Type"]
 # =========================================================
