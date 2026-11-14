@@ -1,0 +1,273 @@
+import os
+import re
+import time
+import json
+import base64
+import tkinter as tk
+
+from openpyxl import load_workbook, Workbook
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import (
+    TimeoutException, StaleElementReferenceException, NoSuchElementException
+)
+
+# ===================== CONFIGURATION =====================
+INPUT_EXCEL = r"C:\path\to\your_input.xlsx"       # <-- your Excel file (Udyam in E2.., vendor in C2..)
+OUTPUT_EXCEL = r"C:\path\to\output.xlsx"          # <-- results file (A:Name, B:Udyam No, C:Activity, D:Year, E:Type)
+PDF_FOLDER = r"C:\path\to\pdfs"                   # <-- where PDFs will be saved
+INVALID_TXT = os.path.join(PDF_FOLDER, "invalidnumber.txt")
+START_ROW = 2
+VENDOR_COL = 3  # C
+UDYAM_COL = 5   # E
+URL = "https://www.udyamregistration.gov.in/default.aspx"
+OUTPUT_HEADERS = ["Enterprise Name", "Udyam Number", "Activity", "Year", "Type"]
+# =========================================================
+
+os.makedirs(PDF_FOLDER, exist_ok=True)
+
+def safe_filename(name):
+    name = re.sub(r'[\\/:*?"<>|]', "_", str(name)).strip()
+    return name or "unnamed"
+
+
+def unique_path(folder, base, ext=".pdf"):
+    path = os.path.join(folder, base + ext)
+    i = 1
+    while os.path.exists(path):
+        path = os.path.join(folder, f"{base}_{i}{ext}")
+        i += 1
+    return path
+
+def ask_captcha(png_bytes, message="Enter the captcha"):
+    """Always-on-top window showing captcha with a textbox and OK button."""
+    result = {"text": ""}
+    root = tk.Tk()
+    root.title("Captcha")
+    root.attributes("-topmost", True)
+    root.resizable(False, False)
+
+    img = tk.PhotoImage(data=base64.b64encode(png_bytes))
+    tk.Label(root, text=message).pack(padx=10, pady=(10, 2))
+    tk.Label(root, image=img).pack(padx=10, pady=5)
+
+    entry = tk.Entry(root, font=("Arial", 14), justify="center")
+    entry.pack(padx=10, pady=5)
+
+    def on_ok(event=None):
+        result["text"] = entry.get().strip()
+        root.destroy()
+
+    tk.Button(root, text="OK", width=10, command=on_ok).pack(pady=(5, 10))
+    root.bind("<Return>", on_ok)
+
+    root.update_idletasks()
+    w, h = root.winfo_width(), root.winfo_height()
+    x = (root.winfo_screenwidth() - w) // 2
+    y = (root.winfo_screenheight() - h) // 2
+    root.geometry(f"+{x}+{y}")
+
+    root.lift()
+    root.focus_force()
+    entry.focus_set()
+    root.mainloop()
+    return result["text"]
+
+def make_driver():
+    opts = webdriver.ChromeOptions()
+    app_state = {
+        "recentDestinations": [{"id": "Save as PDF", "origin": "local", "account": ""}],
+        "selectedDestinationId": "Save as PDF",
+        "version": 2,
+    }
+    opts.add_experimental_option("prefs", {
+        "printing.print_preview_sticky_settings.appState": json.dumps(app_state),
+        "savefile.default_directory": os.path.abspath(PDF_FOLDER),
+        "download.default_directory": os.path.abspath(PDF_FOLDER),
+    })
+    opts.add_argument("--kiosk-printing")
+    opts.add_argument("--start-maximized")
+    return webdriver.Chrome(options=opts)
+
+def get_text(driver, element_id):
+    try:
+        return driver.find_element(By.ID, element_id).text.strip()
+    except NoSuchElementException:
+        return ""
+
+def get_year_and_type(driver):
+    """Find the <td> that looks like '2026-27' and take the next <td> as the Type."""
+    cells = driver.find_elements(
+        By.XPATH, "//td[@valign='top' and contains(@style,'text-align: center')]"
+    )
+    for cell in cells:
+        txt = cell.text.strip()
+        if re.fullmatch(r"\d{4}-\d{2}", txt):
+            try:
+                nxt = cell.find_element(By.XPATH, "following-sibling::td[1]")
+                return txt, nxt.text.strip()
+            except NoSuchElementException:
+                return txt, ""
+    return "", ""
+
+def wait_for_outcome(driver, timeout=30):
+    """Returns 'invalid', 'captcha', 'success' or 'timeout'."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            inv = driver.find_elements(By.ID, "ctl00_ContentPlaceHolder1_revUamNo")
+            if inv and inv[0].is_displayed():
+                return "invalid"
+            cap = driver.find_elements(By.ID, "ctl00_ContentPlaceHolder1_lblCaptcha")
+            if cap and cap[0].is_displayed() and "Incorrect" in cap[0].text:
+                return "captcha"
+            name = driver.find_elements(By.ID, "ctl00_ContentPlaceHolder1_lblEnterpriseName")
+            if name and name[0].text.strip():
+                return "success"
+        except StaleElementReferenceException:
+            pass
+        time.sleep(0.5)
+    return "timeout"
+
+def save_page_pdf(driver, vendor):
+    """Click the page's Print button and rename the resulting PDF to the vendor name."""
+    before = set(os.listdir(PDF_FOLDER))
+    main_handle = driver.current_window_handle
+    handles_before = set(driver.window_handles)
+
+    WebDriverWait(driver, 20).until(
+        EC.element_to_be_clickable((By.ID, "ctl00_ContentPlaceHolder1_btnPrint"))
+    ).click()
+
+    new_file = None
+    end = time.time() + 30
+    while time.time() < end:
+        now = set(os.listdir(PDF_FOLDER))
+        diff = [f for f in now - before
+                if f.lower().endswith(".pdf")]
+        if diff:
+            time.sleep(1)
+            new_file = diff[0]
+            break
+        time.sleep(0.5)
+
+    for h in driver.window_handles:
+        if h not in handles_before:
+            try:
+                driver.switch_to.window(h)
+                driver.close()
+            except Exception:
+                pass
+    driver.switch_to.window(main_handle)
+
+    if new_file:
+        target = unique_path(PDF_FOLDER, safe_filename(vendor))
+        os.replace(os.path.join(PDF_FOLDER, new_file), target)
+        print(f"   PDF saved: {target}")
+    else:
+        print("   WARNING: PDF was not detected after clicking Print.")
+
+def open_verify_page(driver):
+    driver.get(URL)
+    link = WebDriverWait(driver, 20).until(
+        EC.presence_of_element_located((By.XPATH, "//a[@href='/Udyam_Verify.aspx']"))
+    )
+    driver.execute_script("arguments[0].click();", link)
+    WebDriverWait(driver, 20).until(
+        EC.presence_of_element_located((By.ID, "ctl00_ContentPlaceHolder1_txtUdyamNo"))
+    )
+
+def process_one(driver, udyam, vendor):
+    """Returns (enterprise, udyam_no, activity, year, type) or None if invalid."""
+    open_verify_page(driver)
+
+    udyam_box = driver.find_element(By.ID, "ctl00_ContentPlaceHolder1_txtUdyamNo")
+    udyam_box.clear()
+    udyam_box.send_keys(udyam)
+
+    message = "Enter the captcha"
+    while True:
+        captcha_img = WebDriverWait(driver, 20).until(
+            EC.visibility_of_element_located((By.ID, "ctl00_ContentPlaceHolder1_imgCaptcha"))
+        )
+        time.sleep(1)
+        png = captcha_img.screenshot_as_png 
+
+        code = ask_captcha(png, f"{udyam}\n{message}")
+
+        udyam_box = driver.find_element(By.ID, "ctl00_ContentPlaceHolder1_txtUdyamNo")
+        if not udyam_box.get_attribute("value"):
+            udyam_box.send_keys(udyam)
+
+        cap_box = driver.find_element(By.ID, "ctl00_ContentPlaceHolder1_txtCaptcha")
+        cap_box.clear()
+        cap_box.send_keys(code)
+
+        driver.find_element(By.ID, "ctl00_ContentPlaceHolder1_btnVerify").click()
+
+        outcome = wait_for_outcome(driver)
+        if outcome == "invalid":
+            with open(INVALID_TXT, "a", encoding="utf-8") as f:
+                f.write(udyam + "\n")
+            print("   Invalid Udyam number -> saved to invalidnumber.txt")
+            return None
+        if outcome == "captcha":
+            message = "Incorrect captcha. Try again."
+            continue
+        if outcome == "success":
+            break
+        print("   Timed out waiting for result.")
+        return None
+
+    time.sleep(1)
+    enterprise = get_text(driver, "ctl00_ContentPlaceHolder1_lblEnterpriseName")
+    udyam_no = get_text(driver, "ctl00_ContentPlaceHolder1_lbludyamregNo") or udyam
+    activity = get_text(driver, "ctl00_ContentPlaceHolder1_lblServices")
+    year, etype = get_year_and_type(driver)
+
+    save_page_pdf(driver, vendor)
+    return enterprise, udyam_no, activity, year, etype
+
+
+def main():
+    wb_in = load_workbook(INPUT_EXCEL, data_only=True)
+    ws_in = wb_in.active
+
+    if os.path.exists(OUTPUT_EXCEL):
+        wb_out = load_workbook(OUTPUT_EXCEL)
+        ws_out = wb_out.active
+    else:
+        wb_out = Workbook()
+        ws_out = wb_out.active
+        ws_out.append(OUTPUT_HEADERS)
+
+    driver = make_driver()
+    try:
+        for row in range(START_ROW, ws_in.max_row + 1):
+            udyam = ws_in.cell(row=row, column=UDYAM_COL).value
+            vendor = ws_in.cell(row=row, column=VENDOR_COL).value
+            if not udyam or not str(udyam).strip():
+                continue
+            udyam = str(udyam).strip()
+            vendor = str(vendor).strip() if vendor else udyam
+
+            print(f"Row {row}: {udyam} | {vendor}")
+            try:
+                data = process_one(driver, udyam, vendor)
+            except Exception as e:
+                print(f"   ERROR: {e}")
+                continue
+
+            if data:
+                ws_out.append(list(data))
+                wb_out.save(OUTPUT_EXCEL)
+                print(f"   Data: {data}")
+    finally:
+        driver.quit()
+        wb_out.save(OUTPUT_EXCEL)
+        print("Done.")
+
+if __name__ == "__main__":
+    main()
